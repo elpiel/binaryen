@@ -2862,7 +2862,7 @@ void Wasm2JSGlue::emitMemory() {
       uint8Array[j++] = base64ReverseLookup[b64.charCodeAt(i)] << 2 | b1 >> 4;
       if (j < end) uint8Array[j++] = b1 << 4 | b2 >> 2;
       if (j < end) uint8Array[j++] = b2 << 6 | base64ReverseLookup[b64.charCodeAt(i+3)];
-    })";
+  }";
   if (wasm.features.hasBulkMemory()) {
     // Passive segments in bulk memory are initialized into new arrays that are
     // passed into here, and we need to return them.
