@@ -28,6 +28,7 @@ wasm2js_tests = shared.get_tests(shared.get_test_dir('wasm2js'), ['.wast'])
 assert_tests = ['wasm2js.wast.asserts']
 # These tests exercise functionality not supported by wasm2js
 wasm2js_skipped_tests = [
+    "grow_memory.wast", # skip because of new memory managert
     'empty_imported_table.wast',
     'br.wast',  # depends on multivalue
     'fac.wast',  # depends on mutlivalue
