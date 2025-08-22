@@ -331,8 +331,7 @@ private:
   void addStart(Ref ast, Module* wasm);
   void addExports(Ref ast, Module* wasm);
   void addGlobal(Ref ast, Global* global, Module* module);
-  void addMemoryFuncs(Ref ast, Module* wasm);
-  void addMemoryGrowFunc(Ref ast, Module* wasm);
+  void addMemoryManager(Ref ast, Module* wasm);
 
   Wasm2JSBuilder() = delete;
   Wasm2JSBuilder(const Wasm2JSBuilder&) = delete;
@@ -440,6 +439,9 @@ Ref Wasm2JSBuilder::processWasm(Module* wasm, Name funcName) {
 #endif
 
   Ref ret = ValueBuilder::makeToplevel();
+
+  addMemoryManager(ret, wasm);
+
   Ref asmFunc = ValueBuilder::makeFunction(funcName);
   ret[1]->push_back(asmFunc);
   ValueBuilder::appendArgumentToFunction(asmFunc, importObject);
@@ -475,15 +477,32 @@ Ref Wasm2JSBuilder::processWasm(Module* wasm, Name funcName) {
             ValueBuilder::makeName(WASM_MEMORY_GROW))));
       }
     } else {
+      // Create an object for memory options using the array-based structure ['object', [['key', value], ...]]
+      Ref memoryOptions = ValueBuilder::makeObject();
+      
+      // Add 'initial' property: ['initial', initial_value]
+      Ref initialPair = ValueBuilder::makeArray();
+      initialPair->push_back(ValueBuilder::makeString("initial"));
+      initialPair->push_back(ValueBuilder::makeNum(wasm->memories[0]->initial.addr));
+      memoryOptions[1]->push_back(initialPair);
+
+      // Add 'maximum' property if it exists
+      if (wasm->memories[0]->hasMax()) {
+        Ref maxPair = ValueBuilder::makeArray();
+        maxPair->push_back(ValueBuilder::makeString("maximum"));
+        maxPair->push_back(ValueBuilder::makeNum(wasm->memories[0]->max.addr));
+        memoryOptions[1]->push_back(maxPair);
+      }
+
       Ref theVar = ValueBuilder::makeVar();
       asmFunc[3]->push_back(theVar);
       ValueBuilder::appendToVar(
         theVar,
-        BUFFER,
+        "memory",
         ValueBuilder::makeNew(ValueBuilder::makeCall(
-          ValueBuilder::makeName("ArrayBuffer"),
-          ValueBuilder::makeInt(Address::address32_t(
-            wasm->memories[0]->initial.addr * Memory::kPageSize)))));
+          ValueBuilder::makeName("Wasm2jsMemory"),
+          memoryOptions
+      )));
     }
   }
 
@@ -794,6 +813,10 @@ void Wasm2JSBuilder::addExports(Ref ast, Module* wasm) {
         ValueBuilder::appendToCall(memory, descs);
         ValueBuilder::appendToObjectWithQuotes(
           exports, fromName(export_->name, NameScope::Export), memory);
+        
+      ValueBuilder::appendToObject(
+        exports, export_->name, ValueBuilder::makeName("memory")
+      );
         break;
       }
       case ExternalKind::Table: {
@@ -845,9 +868,6 @@ void Wasm2JSBuilder::addExports(Ref ast, Module* wasm) {
       case ExternalKind::Invalid:
         Fatal() << "unsupported export type: " << export_->name << "\n";
     }
-  }
-  if (!wasm->memories.empty()) {
-    addMemoryFuncs(ast, wasm);
   }
   ast->push_back(
     ValueBuilder::makeStatement(ValueBuilder::makeReturn(exports)));
@@ -2485,140 +2505,94 @@ Ref Wasm2JSBuilder::processExpression(Expression* curr,
   return ExpressionProcessor(this, m, func, standaloneFunction).process(curr);
 }
 
-void Wasm2JSBuilder::addMemoryFuncs(Ref ast, Module* wasm) {
-  Ref memorySizeFunc = ValueBuilder::makeFunction(WASM_MEMORY_SIZE);
-  memorySizeFunc[3]->push_back(ValueBuilder::makeReturn(
-    makeJsCoercion(ValueBuilder::makeBinary(
-                     ValueBuilder::makeDot(ValueBuilder::makeName(BUFFER),
-                                           IString("byteLength")),
-                     DIV,
-                     ValueBuilder::makeInt(Memory::kPageSize)),
-                   JsType::JS_INT)));
-  ast->push_back(memorySizeFunc);
-
-  if (!wasm->memories.empty() &&
-      wasm->memories[0]->max > wasm->memories[0]->initial) {
-    addMemoryGrowFunc(ast, wasm);
+void Wasm2JSBuilder::addMemoryManager(Ref ast, Module* wasm) {
+  if (wasm->memories.empty() || wasm->memories[0]->imported()) {
+    return;
   }
-}
-
-void Wasm2JSBuilder::addMemoryGrowFunc(Ref ast, Module* wasm) {
-  Ref memoryGrowFunc = ValueBuilder::makeFunction(WASM_MEMORY_GROW);
-  ValueBuilder::appendArgumentToFunction(memoryGrowFunc, IString("pagesToAdd"));
-
-  memoryGrowFunc[3]->push_back(
-    ValueBuilder::makeStatement(ValueBuilder::makeBinary(
-      ValueBuilder::makeName(IString("pagesToAdd")),
-      SET,
-      makeJsCoercion(ValueBuilder::makeName(IString("pagesToAdd")),
-                     JsType::JS_INT))));
-
-  Ref oldPages = ValueBuilder::makeVar();
-  memoryGrowFunc[3]->push_back(oldPages);
-  ValueBuilder::appendToVar(
-    oldPages,
-    IString("oldPages"),
-    makeJsCoercion(ValueBuilder::makeCall(WASM_MEMORY_SIZE), JsType::JS_INT));
-
-  Ref newPages = ValueBuilder::makeVar();
-  memoryGrowFunc[3]->push_back(newPages);
-  ValueBuilder::appendToVar(
-    newPages,
-    IString("newPages"),
-    makeJsCoercion(
-      ValueBuilder::makeBinary(ValueBuilder::makeName(IString("oldPages")),
-                               PLUS,
-                               ValueBuilder::makeName(IString("pagesToAdd"))),
-      JsType::JS_INT));
-
-  Ref block = ValueBuilder::makeBlock();
-  memoryGrowFunc[3]->push_back(ValueBuilder::makeIf(
-    ValueBuilder::makeBinary(
-      ValueBuilder::makeBinary(ValueBuilder::makeName(IString("oldPages")),
-                               LT,
-                               ValueBuilder::makeName(IString("newPages"))),
-      IString("&&"),
-      ValueBuilder::makeBinary(ValueBuilder::makeName(IString("newPages")),
-                               LT,
-                               ValueBuilder::makeInt(Memory::kMaxSize32))),
-    block,
-    NULL));
-
-  Ref newBuffer = ValueBuilder::makeVar();
-  ValueBuilder::appendToBlock(block, newBuffer);
-  ValueBuilder::appendToVar(
-    newBuffer,
-    IString("newBuffer"),
-    ValueBuilder::makeNew(ValueBuilder::makeCall(
-      ARRAY_BUFFER,
-      ValueBuilder::makeCall(MATH_IMUL,
-                             ValueBuilder::makeName(IString("newPages")),
-                             ValueBuilder::makeInt(Memory::kPageSize)))));
-
-  Ref newHEAP8 = ValueBuilder::makeVar();
-  ValueBuilder::appendToBlock(block, newHEAP8);
-  ValueBuilder::appendToVar(newHEAP8,
-                            IString("newHEAP8"),
-                            ValueBuilder::makeNew(ValueBuilder::makeCall(
-                              ValueBuilder::makeName(INT8ARRAY),
-                              ValueBuilder::makeName(IString("newBuffer")))));
-
-  ValueBuilder::appendToBlock(
-    block,
-    ValueBuilder::makeCall(
-      ValueBuilder::makeDot(ValueBuilder::makeName(IString("newHEAP8")),
-                            IString("set")),
-      ValueBuilder::makeName(HEAP8)));
-
-  auto setHeap = [&](IString name, IString view) {
-    ValueBuilder::appendToBlock(
-      block,
-      ValueBuilder::makeBinary(
-        ValueBuilder::makeName(name),
-        SET,
-        ValueBuilder::makeNew(ValueBuilder::makeCall(
-          ValueBuilder::makeName(view),
-          ValueBuilder::makeName(IString("newBuffer"))))));
+  // This JS code is the complete memory manager. It's an IIFE that returns the constructor.
+  const char* memoryManagerJS = R"((function() {
+  function detachBuffer(buffer) {
+    const error = () => { throw new TypeError('Cannot perform any action on a detached ArrayBuffer.'); };
+    return new Proxy(buffer, {
+      get: error, set: error, has: error, deleteProperty: error, defineProperty: error,
+      getOwnPropertyDescriptor: error, ownKeys: error, isExtensible: error,
+      preventExtensions: error, getPrototypeOf: error, setPrototypeOf: error,
+    });
+  }
+  class Wasm2jsMemory {
+    constructor(options) {
+      this._initial = options.initial;
+      this._maximum = options.maximum;
+      this._buffer = new ArrayBuffer(this._initial * 65536);
+      this._recreateViews();
+    }
+    _recreateViews() {
+      HEAPU8 = new Uint8Array(this._buffer);
+      HEAP8 = new Int8Array(this._buffer);
+      HEAPU16 = new Uint16Array(this._buffer);
+      HEAP16 = new Int16Array(this._buffer);
+      HEAPU32 = new Uint32Array(this._buffer);
+      HEAP32 = new Int32Array(this._buffer);
+      HEAPF32 = new Float32Array(this._buffer);
+      HEAPF64 = new Float64Array(this._buffer);
+    }
+    grow(pages) {
+      const oldPages = this._buffer.byteLength / 65536;
+      const newPages = oldPages + pages;
+      if (this._maximum !== undefined && newPages > this._maximum) {
+        throw new RangeError('Failed to grow memory');
+      }
+      try {
+        const newBuffer = new ArrayBuffer(newPages * 65536);
+        new Uint8Array(newBuffer).set(new Uint8Array(this._buffer));
+        const oldBuffer = this._buffer;
+        this._buffer = newBuffer;
+        this._recreateViews();
+        Object.setPrototypeOf(oldBuffer, detachBuffer(oldBuffer));
+        return oldPages;
+      } catch (e) {
+        throw new RangeError('Failed to grow memory');
+      }
+    }
+  }
+  const handler = {
+    get(target, prop, receiver) {
+      if (prop === 'buffer') { return target._buffer; }
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value === 'function') { return value.bind(target); }
+      return value;
+    }
   };
+  return function(options) {
+    const memoryInstance = new Wasm2jsMemory(options);
+    return new Proxy(memoryInstance, handler);
+  };
+})())";
 
-  setHeap(HEAP8, INT8ARRAY);
-  setHeap(HEAP16, INT16ARRAY);
-  setHeap(HEAP32, INT32ARRAY);
-  setHeap(HEAPU8, UINT8ARRAY);
-  setHeap(HEAPU16, UINT16ARRAY);
-  setHeap(HEAPU32, UINT32ARRAY);
-  setHeap(HEAPF32, FLOAT32ARRAY);
-  setHeap(HEAPF64, FLOAT64ARRAY);
+  // Create a variable 'Wasm2jsMemory' and assign our IIFE to it.
+  // Create a 'var' statement.
+  Ref theVar = ValueBuilder::makeVar();
 
-  ValueBuilder::appendToBlock(
-    block,
-    ValueBuilder::makeBinary(ValueBuilder::makeName(BUFFER),
-                             SET,
-                             ValueBuilder::makeName(IString("newBuffer"))));
+  // Append the variable 'Wasm2jsMemory' and its IIFE value to the 'var' statement.
+  ValueBuilder::appendToVar(
+    theVar,
+    "Wasm2jsMemory",
+    ValueBuilder::makeCall(ValueBuilder::makeName(memoryManagerJS))
+  );
 
-  // apply the changes to the memory import
-  if (!wasm->memories.empty() && wasm->memories[0]->imported()) {
-    ValueBuilder::appendToBlock(
-      block,
-      ValueBuilder::makeBinary(
-        ValueBuilder::makeDot(ValueBuilder::makeName("memory"),
-                              ValueBuilder::makeName(BUFFER)),
-        SET,
-        ValueBuilder::makeName(BUFFER)));
-  }
+  // Add the complete 'var Wasm2jsMemory = ...;' statement to the AST.
+  ast[1]->push_back(ValueBuilder::makeStatement(theVar));
 
-  if (needsBufferView(*wasm)) {
-    ValueBuilder::appendToBlock(
-      block,
-      ValueBuilder::makeBinary(ValueBuilder::makeName("bufferView"),
-                               SET,
-                               ValueBuilder::makeName(HEAPU8)));
-  }
-
-  memoryGrowFunc[3]->push_back(
-    ValueBuilder::makeReturn(ValueBuilder::makeName(IString("oldPages"))));
-
-  ast->push_back(memoryGrowFunc);
+  // Define the global 'memory.grow' function which calls the method on our proxy.
+  Ref growBody = ValueBuilder::makeBlock();
+  growBody[1]->push_back(ValueBuilder::makeReturn(ValueBuilder::makeCall(
+    ValueBuilder::makeDot(ValueBuilder::makeName("memory"), ValueBuilder::makeName("grow")),
+    ValueBuilder::makeName("pages")
+  )));
+  Ref grow = ValueBuilder::makeFunction(WASM_MEMORY_GROW);
+  ValueBuilder::appendArgumentToFunction(grow, "pages");
+  grow[3] = growBody;
+  ast[1]->push_back(grow);
 }
 
 // Wasm2JSBuilder emits the core of the module - the functions etc. that would
